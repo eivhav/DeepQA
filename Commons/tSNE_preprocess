@@ -1,0 +1,27 @@
+# Eivind Havikbotn (havikbot@stud.ntnu.no)
+# Github repo github.com/eivhav/DeepQA
+
+classes = [[' sim ', ' simkort '], ['dekning'], ['direkt', 'direktemelding', 'direkte melding'], ['faktura', 'regning'], ['bestil'], ['forhandler']]
+
+path = '/home/havikbot/semantics_labels_2.tsv'
+lines = open(path, 'r+').readlines()
+out_lines = []
+for line in lines:
+    line = line.replace('A', 'å').replace('O', 'ø').replace('E', 'æ').strip()
+    class_found = False
+    for i in range(len(classes)):
+        for c1 in classes[i]:
+            if c1 in line:
+                line = line + '\t' + 'class'+ str(classes[i]) + '\n'
+                class_found = True
+                break
+        if class_found:
+            break
+    if not class_found:
+        line = line + '\t' + 'None' + '\n'
+
+    out_lines.append(line)
+
+open(path+'withclass', 'w+').writelines(out_lines)
+
+

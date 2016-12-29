@@ -1,0 +1,193 @@
+# Eivind Havikbotn (havikbot@stud.ntnu.no)
+# Github repo github.com/eivhav/DeepQA
+
+import numpy as np
+import os, random
+from cDSSM_data import cDSSM_dataClass as dataModule_Insurance
+from cDSSM_data_tele import cDSSM_dataClass as dataModule_tele
+from cDSSM_model import cDSSM_modelClass as model_class
+from cDSSM_lstm import cDSSM_lstmClass as lstm_class
+
+from Commons import Evaluator as evaluator
+from sklearn.metrics.pairwise import cosine_similarity
+import time
+from keras.callbacks import History, ModelCheckpoint, EarlyStopping
+import keras.backend.tensorflow_backend as ker_tf
+
+# Define data attributes
+data_mod = dataModule_tele()
+# data_mod = dataModule_Insurance()
+samples_to_run1 = 17200
+validate_size = 4300
+test_interval = [50000, 53000]
+
+TOTAL_LETTER_GRAMS = int(len(data_mod.used_tri_letters)+2)
+J = 1
+models = None
+n_epochs = 80
+batch_size = 50
+
+
+def get_batch_sentence_matrix(sentences):
+    batch_size2 = len(sentences)
+    max_length = len(max(sentences, key=len)) + 3
+    sentence_matrix = np.zeros((batch_size2, max_length, models.WORD_DEPTH), dtype=np.float32)
+    for i2 in range(batch_size2):
+        s = sentences[i2]
+        s.insert(0, [TOTAL_LETTER_GRAMS - 2])
+        s.append([TOTAL_LETTER_GRAMS - 1])
+        for w in range(1, len(s) - 1):
+            hash_tri_gram = []
+            for j in range(3):
+                word_vector = s[w - 1 + j]
+                for p1 in word_vector:
+                    if ((TOTAL_LETTER_GRAMS * j) + p1) not in hash_tri_gram:
+                        hash_tri_gram.append((TOTAL_LETTER_GRAMS * j) + p1)
+
+            for h in hash_tri_gram:
+                sentence_matrix[i2][w - 1][h] = 1
+
+    return sentence_matrix
+
+
+def batch_gen(myModel, sample_size, epochs, batch_size, data_start):
+    post_data = data_mod.data
+    qa_pairs = post_data[data_start: data_start + sample_size + (batch_size*20)]
+    y = np.ones((batch_size, 1))
+    for e in range(epochs):
+        start = 10
+        if e == 0 or data_start >= samples_to_run1: start = 0
+        random.shuffle(qa_pairs)
+        l_Qs = []
+        pos_l_Ds = []
+        for qa in qa_pairs:
+            l_Qs.append(qa[0])
+            pos_l_Ds.append(qa[1])
+
+        for ba in range(start, int(sample_size / batch_size) + 10):
+            k = ba*batch_size
+            batch_neg_data = [[] for n in range(J)]
+            for j in range(k, k+batch_size):
+
+                possibilities = list(range(sample_size + (10*batch_size)))
+                possibilities.remove(j)
+                negatives = np.random.choice(possibilities, J)
+                negs = [pos_l_Ds[negative] for negative in negatives]
+
+                for n in range(J):
+                    batch_neg_data[n].append(negs[n])
+
+            x_batch = [get_batch_sentence_matrix(l_Qs[k:(k+batch_size)]),
+                       get_batch_sentence_matrix(pos_l_Ds[k:(k+batch_size)])] + \
+                      [get_batch_sentence_matrix(batch_neg_data[n]) for n in range(J)]
+            yield x_batch, y
+
+
+config = ker_tf.tf.ConfigProto()
+config.gpu_options.allow_growth=False
+ker_tf.set_session(ker_tf.tf.Session(config=config))
+
+models = model_class(TOTAL_LETTER_GRAMS, J, 'tf')
+# models = lstm_class(TOTAL_LETTER_GRAMS, J, 'tf')
+model_id = 'final_Telia_60_120_ord_500_300'
+model = models.training_model
+print(model.summary())
+
+
+def train_model():
+    earlyStop = EarlyStopping(monitor='val_loss', min_delta=0, patience=3, verbose=0, mode='auto')
+    checkpoint = ModelCheckpoint(data_mod.inputPath+ model_id+'.h5',
+                                 monitor='val_loss',
+                                 verbose=0, save_best_only=True,
+                                 save_weights_only=True,
+                                 mode='auto')
+
+    model.fit_generator(batch_gen(model, samples_to_run1, n_epochs+1, batch_size, 1),
+                            samples_to_run1,
+                            n_epochs,
+                            verbose=1,
+                            nb_val_samples= validate_size,
+                            validation_data=batch_gen(model, validate_size, n_epochs+1, batch_size, samples_to_run1 + (10 * batch_size)),
+                            callbacks=[earlyStop, checkpoint],
+                            )
+
+# Either train or load model
+# train_model()
+# models.training_model.load_weights(data_mod.inputPath+ model_id+'.h5')
+
+# Evaluation:
+def get_similarity_matrix(qa_data_pairs):
+    batch_size = 50
+    l_Qs = []
+    pos_l_Ds = []
+
+    query_sems = None
+    doc_sems = None
+    for i in range(0, batch_size*int(len(qa_data_pairs) / batch_size)):
+        l_Qs.append(qa_data_pairs[i][0])
+        pos_l_Ds.append(qa_data_pairs[i][1])
+
+    for i in range(0, len(l_Qs), batch_size):
+        q_preds = models.query_sem_model.predict(get_batch_sentence_matrix(l_Qs[i:i + batch_size]), batch_size=batch_size)
+        d_preds = models.doc_sem_model.predict(get_batch_sentence_matrix(pos_l_Ds[i:i + batch_size]), batch_size=batch_size)
+
+        if query_sems is None:
+            query_sems = q_preds
+            doc_sems = d_preds
+        else:
+            query_sems = np.concatenate((query_sems, q_preds), axis=0)
+            doc_sems = np.concatenate((doc_sems, d_preds), axis=0)
+
+        if (i % 500 == 0):
+            print("Predicted for", i)
+
+
+
+    print('Data predicted', "shape", query_sems.shape)
+    return (query_sems, doc_sems, cosine_similarity(query_sems, doc_sems)) # Might need two list instead of 2 numpy arrays
+
+qa_pairs = data_mod.data[test_interval[0]:test_interval[1]]
+qa_pairs_text = data_mod.qa_pairs_text[test_interval[0]:test_interval[1]]
+duplicate_qestions = False
+
+if qa_pairs_text is not None and duplicate_qestions:
+    validate_qas_pre = qa_pairs
+    val_qa_strings = qa_pairs_text
+    val_dict = dict()
+    validate_qas = []
+    for i in range(len(val_qa_strings)): val_dict[val_qa_strings[i][0]] = i
+    for i in val_dict.keys(): validate_qas.append(validate_qas_pre[val_dict[i]])
+else:
+    validate_qas = qa_pairs
+
+
+from Commons import BM25 as bm25
+bm25.eval_BM25(qa_pairs_text)
+#bm25.eval_LDA(qa_pairs_text)
+
+res = get_similarity_matrix(validate_qas)
+sim_matrix = res[2]
+eval_methods = [('MMR', 0), ('Top', 1), ('Top', 5), ('Top', 20), ('Print_ans', 50)]
+evaluator.evaulate(validate_qas, qa_pairs_text, sim_matrix, eval_methods)
+
+
+def generate_tsne_files():
+    query_out = ""
+    query_text_out = "header \t label" + '\n'
+    for i in range(res[0].shape[0]):
+        for j in range(len(res[0][i])):
+            query_out = query_out + str(res[0][i][j]) + '\t'
+        query_out= query_out[0:-2] + '\n'
+        query_text_out = query_text_out + str(qa_pairs_text[i][0]) + '\n'
+
+    open('/home/havikbot/semantics_2.tsv', 'w+').write(query_out)
+    open('/home/havikbot/semantics_labels_2.tsv', 'w+').write(query_text_out)
+
+
+
+
+
+
+
+
+
